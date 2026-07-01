@@ -45,7 +45,15 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/124.0.0.0 Safari/537.36"
     ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "en-NZ,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Referer": "https://www.parkrun.co.nz/",
 }
 
 # ── Scraper ──────────────────────────────────────────────────────────────────
@@ -55,12 +63,13 @@ def get_session() -> requests.Session:
     sess.headers.update(HEADERS)
     cookie_str = os.environ.get("PARKRUN_COOKIE", "")
     if cookie_str:
-        # Cookie string format: "name1=value1; name2=value2"
-        for part in cookie_str.split(";"):
-            part = part.strip()
-            if "=" in part:
-                name, _, value = part.partition("=")
-                sess.cookies.set(name.strip(), value.strip(), domain=".parkrun.co.nz")
+        # Set cookies on all parkrun domains
+        for domain in [".parkrun.co.nz", ".parkrun.org.uk", ".parkrun.com.au"]:
+            for part in cookie_str.split(";"):
+                part = part.strip()
+                if "=" in part:
+                    name, _, value = part.partition("=")
+                    sess.cookies.set(name.strip(), value.strip(), domain=domain)
         print("✓ Session cookie loaded from environment")
     else:
         print("  No PARKRUN_COOKIE env var — attempting unauthenticated fetch")
@@ -69,6 +78,14 @@ def get_session() -> requests.Session:
 
 def fetch_results() -> list[dict]:
     sess = get_session()
+
+    # Try the JSON results API first — more stable than HTML scraping
+    runs = fetch_via_json_api(sess)
+    if runs:
+        return runs
+
+    # Fallback: scrape the HTML results page
+    print("  JSON API failed — trying HTML scrape...")
     urls = [
         f"https://www.parkrun.co.nz/parkrunner/{ATHLETE_ID}/all/",
         f"https://www.parkrun.org.uk/parkrunner/{ATHLETE_ID}/all/",
@@ -85,6 +102,69 @@ def fetch_results() -> list[dict]:
         except Exception as e:
             print(f"  Error: {e}")
     return []
+
+
+def fetch_via_json_api(sess: requests.Session) -> list[dict]:
+    """Parkrun exposes athlete results as JSON — faster and more reliable."""
+    url = f"https://www.parkrun.org.uk/results/athleteresultshistory/?athleteNumber={ATHLETE_ID}&offset=0&numberofresults=1000"
+    try:
+        sess.headers.update({"Accept": "application/json, text/javascript, */*; q=0.01",
+                              "X-Requested-With": "XMLHttpRequest"})
+        r = sess.get(url, timeout=20)
+        print(f"  JSON API → {r.status_code}")
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        # Response structure: {"data": {"Results": [...]}}
+        results = (data.get("data") or {}).get("Results", [])
+        if not results:
+            return []
+        runs = []
+        for res in results:
+            try:
+                event_raw  = res.get("EventLongName", res.get("EventName", "Unknown"))
+                event_slug = re.sub(r"[^a-z0-9]", "", event_raw.lower())
+                run_date   = res.get("RunDate", "")
+                time_raw   = res.get("FinishTime", "0:00")
+                pos        = str(res.get("AgeGrading", ""))
+                ag         = float(str(res.get("AgeGrading", "0")).replace("%","").strip() or 0)
+
+                parts = time_raw.strip().split(":")
+                if len(parts) == 2:
+                    secs = int(parts[0]) * 60 + int(parts[1])
+                elif len(parts) == 3:
+                    secs = int(parts[0])*3600 + int(parts[1])*60 + int(parts[2])
+                else:
+                    continue
+
+                parsed_date = None
+                for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d %b %Y"):
+                    try:
+                        parsed_date = datetime.strptime(run_date, fmt).date().isoformat()
+                        break
+                    except ValueError:
+                        pass
+                if not parsed_date:
+                    continue
+
+                country = EVENT_COUNTRY.get(event_slug, "NZ")
+
+                runs.append({
+                    "event": event_slug, "event_raw": event_raw,
+                    "date": parsed_date, "run_no": str(res.get("EventNumber", "")),
+                    "pos": str(res.get("Position", "")),
+                    "secs": secs, "time": time_raw,
+                    "age_grade": ag, "country": country,
+                    "pb": bool(res.get("IsPersonalBest", False)),
+                })
+            except Exception:
+                continue
+        runs.sort(key=lambda r: r["date"])
+        print(f"  JSON API: parsed {len(runs)} runs")
+        return runs
+    except Exception as e:
+        print(f"  JSON API error: {e}")
+        return []
 
 
 def parse_page(html: str, source_url: str) -> list[dict]:
